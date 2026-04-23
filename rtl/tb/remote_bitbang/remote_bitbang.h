@@ -8,21 +8,21 @@
 
 #define VERBOSE 0
 
-int rbs_err;
+extern int rbs_err;
 
-unsigned char tck;
-unsigned char tms;
-unsigned char tdi;
-unsigned char trstn;
-unsigned char tdo;
-unsigned char quit;
+extern unsigned char tck;
+extern unsigned char tms;
+extern unsigned char tdi;
+extern unsigned char trstn;
+extern unsigned char tdo;
+extern unsigned char quit;
 
-int socket_fd;
-int client_fd;
+extern int socket_fd;
+extern int client_fd;
 
 static const ssize_t buf_size = 64 * 1024;
-char recv_buf[64 * 1024];
-ssize_t recv_start, recv_end;
+extern char recv_buf[64 * 1024];
+extern ssize_t recv_start, recv_end;
 
 // Create a new server, listening for connections from localhost on the given
 // port.
@@ -33,7 +33,7 @@ void rbs_tick(unsigned char *jtag_tck, unsigned char *jtag_tms,
               unsigned char *jtag_tdi, unsigned char *jtag_trstn,
               unsigned char jtag_tdo);
 
-unsigned char rbs_done();
+extern unsigned char rbs_done();
 
 int rbs_exit_code();
 
