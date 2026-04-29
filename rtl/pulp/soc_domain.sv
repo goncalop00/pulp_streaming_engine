@@ -226,7 +226,17 @@ module soc_domain #(
         .NBIT_PADMUX             ( 2                  ),
         .N_UART                  ( N_UART             ),
         .N_SPI                   ( N_SPI              ),
-        .N_I2C                   ( N_I2C              )
+        .N_I2C                   ( N_I2C              ),
+        .C2S_AW_WIDTH            ( C2S_AW_WIDTH       ),
+        .C2S_W_WIDTH             ( C2S_W_WIDTH        ),
+        .C2S_B_WIDTH             ( C2S_B_WIDTH        ),
+        .C2S_AR_WIDTH            ( C2S_AR_WIDTH       ),
+        .C2S_R_WIDTH             ( C2S_R_WIDTH        ),
+        .S2C_AW_WIDTH            ( S2C_AW_WIDTH       ),
+        .S2C_W_WIDTH             ( S2C_W_WIDTH        ),
+        .S2C_B_WIDTH             ( S2C_B_WIDTH        ),
+        .S2C_AR_WIDTH            ( S2C_AR_WIDTH       ),
+        .S2C_R_WIDTH             ( S2C_R_WIDTH        )
    ) pulp_soc_i (
 
         .boot_l2_i                    ( 1'b0                         ),
