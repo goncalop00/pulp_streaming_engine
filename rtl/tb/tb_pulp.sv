@@ -720,6 +720,13 @@ module tb_pulp;
         $timeformat(-9, 0, "ns", 9);
     end: timing_format
 
+   initial begin : wave_dump
+      if ($test$plusargs("DUMP_WAVES")) begin
+         $dumpfile("se_smoke.vcd");
+         $dumpvars(0, tb_pulp);
+      end
+   end
+
    // testbench driver process
    initial
       begin
@@ -731,10 +738,19 @@ module tb_pulp;
          int         num_err;
          int         rd_cnt;
          
-         automatic logic [9:0]  FC_CORE_ID = {5'd31, 5'd0};
+         // FC core hartid: {FC_CORE_CLUSTER_ID=6'd31, 1'b0, FC_CORE_CORE_ID=4'd0}
+         //   = {6'b011111, 1'b0, 4'b0000} = 11'b01111100000 = 0x3E0 = 992
+         // hartsello = hartid[9:0] = 10'h3E0 (hartid < 1024 so hartselhi = 0)
+         // Used only by the non-PRELOAD JTAG-L2-load path.
+         // PRELOAD mode bypasses JTAG boot entirely (force fetch_en instead).
+         automatic logic [9:0]  TARGET_CORE_ID = 10'h3E0;
 
          int entry_point;
          logic [31:0] begin_l2_instr;
+
+         // PRELOAD mode scratch variables
+         logic [31:0] preload_addr, preload_off, preload_word;
+         int          preload_bank, preload_s, preload_w;
 
          error   = 1'b0;
          num_err = 0;
@@ -789,7 +805,7 @@ module tb_pulp;
             debug_mode_if.set_dmactive(1'b1, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
             #10us;   
             end
-            else if (LOAD_L2 == "JTAG") begin
+            else if (LOAD_L2 == "JTAG" || LOAD_L2 == "PRELOAD") begin
                s_bootsel = 2'b01;
             end
 
@@ -878,7 +894,7 @@ module tb_pulp;
 
                debug_mode_if.set_dmactive(1'b1, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
 
-               debug_mode_if.set_hartsel(FC_CORE_ID, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
+               debug_mode_if.set_hartsel(TARGET_CORE_ID, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
 
                $display("[TB] %t - Halting the Core", $realtime);
                debug_mode_if.halt_harts(s_tck, s_tms, s_trstn, s_tdi, s_tdo);
@@ -889,7 +905,7 @@ module tb_pulp;
 
                // long debug module + jtag tests
                if(ENABLE_DM_TESTS == 1) begin
-                  debug_mode_if.run_dm_tests(FC_CORE_ID, begin_l2_instr,
+                  debug_mode_if.run_dm_tests(TARGET_CORE_ID, begin_l2_instr,
                                            error, num_err, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
                   // we don't have any program to load so we finish the testing
                   if (num_err == 0) begin
@@ -918,6 +934,97 @@ module tb_pulp;
                // we have set dpc and loaded the binary, we can go now
                $display("[TB] %t - Resuming the CORE", $realtime);
                debug_mode_if.resume_harts(s_tck, s_tms, s_trstn, s_tdi, s_tdo);
+            end
+
+            // ── PRELOAD mode ────────────────────────────────────────────────────
+            // Fast path: write stimuli directly into tc_sram arrays, then use
+            // the debug module to set DPC and resume. Cuts boot from ~20 min
+            // (JTAG L2 load) to ~200 μs.
+            if (LOAD_L2 == "PRELOAD") begin
+
+               // 1. Read stimuli file.
+               if ($value$plusargs("stimuli=%s", stimuli_file)) begin
+                  $display("PRELOAD: loading from %s", stimuli_file);
+                  $readmemh(stimuli_file, stimuli);
+               end else begin
+                  $display("PRELOAD: loading from ./vectors/stim.txt");
+                  $readmemh("./vectors/stim.txt", stimuli);
+               end
+               num_stim = 0;
+               while (num_stim <= 100000 && stimuli[num_stim] !== 96'bx)
+                  num_stim++;
+               $display("[TB] %t - PRELOAD: %0d stimuli entries", $realtime, num_stim);
+
+               // 2. Minimal JTAG tap init so the debug module can connect.
+               jtag_pkg::jtag_reset(s_tck, s_tms, s_trstn, s_tdi);
+               jtag_pkg::jtag_softreset(s_tck, s_tms, s_trstn, s_tdi);
+               #5us;
+               test_mode_if.init(s_tck, s_tms, s_trstn, s_tdi);
+               jtag_conf_reg = {1'b0, 4'b0, 3'b001, 1'b0}; // JTAG-boot mode
+               test_mode_if.set_confreg(jtag_conf_reg, jtag_conf_rego,
+                   s_tck, s_tms, s_trstn, s_tdi, s_tdo);
+
+               // 3. Release reset, then wait for s_soc_rstn to propagate through
+               //    the 4-stage rstgen synchronizer (~4 SOC clock cycles).
+               //    Without this, the first SOC posedge after reset release still
+               //    sees rst_ni=0 and schedules sram[i] <= X (NBA), overwriting
+               //    the PRELOAD data written immediately below.
+               $display("[TB] %t - PRELOAD: Releasing hard reset", $realtime);
+               s_rst_n = 1'b1;
+               wait(i_dut.soc_domain_i.pulp_soc_i.s_soc_rstn === 1'b1);
+               #1;
+
+               // 4. Write stimuli directly into L2 SRAM arrays.
+               //    Stim format: [95:64] = byte_addr,
+               //                 [31: 0] = word @ byte_addr,
+               //                 [63:32] = word @ byte_addr+4.
+               $display("[TB] %t - PRELOAD: writing to L2 SRAM", $realtime);
+               for (preload_s = 0; preload_s < num_stim; preload_s++) begin
+                  preload_addr = stimuli[preload_s][95:64];
+                  for (preload_w = 0; preload_w < 2; preload_w++) begin
+                     preload_word = preload_w ? stimuli[preload_s][63:32]
+                                              : stimuli[preload_s][31:0];
+                     if (preload_addr >= 32'h1C000000 && preload_addr < 32'h1C008000) begin
+                        // Private Bank 0
+                        preload_off = preload_addr - 32'h1C000000;
+                        i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.bank_sram_pri0_i.sram[preload_off[14:2]] = preload_word;
+                     end else if (preload_addr >= 32'h1C008000 && preload_addr < 32'h1C010000) begin
+                        // Private Bank 1
+                        preload_off = preload_addr - 32'h1C008000;
+                        i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.bank_sram_pri1_i.sram[preload_off[14:2]] = preload_word;
+                     end else if (preload_addr >= 32'h1C010000 && preload_addr < 32'h1C090000) begin
+                        // Interleaved banks 0-3 (bank selected by byte_addr[3:2])
+                        preload_off  = preload_addr - 32'h1C010000;
+                        preload_bank = preload_off[3:2];
+                        case (preload_bank)
+                           0: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[0].bank_i.sram[preload_off[18:4]] = preload_word;
+                           1: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[1].bank_i.sram[preload_off[18:4]] = preload_word;
+                           2: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[2].bank_i.sram[preload_off[18:4]] = preload_word;
+                           3: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[3].bank_i.sram[preload_off[18:4]] = preload_word;
+                        endcase
+                     end else begin
+                        $display("[TB] PRELOAD: addr 0x%08h out of range — skipped", preload_addr);
+                     end
+                     preload_addr = preload_addr + 4;
+                  end
+               end
+               $display("[TB] %t - PRELOAD: SRAM loaded OK", $realtime);
+
+               // Wait for cluster FLL to lock and reset synchronizer to clear.
+               #200us;
+
+               // 5. Enable cluster fetch via CCU MMIO write (SBA → S2C AXI → cluster periph xbar).
+               //    cluster_domain.sv ties fetch_en_i=1'b0; vopt constant-propagates the net
+               //    away so "force fetch_en_i" is a silent no-op in optimised simulation.
+               //    Instead: write 0xFF to CCU register 0x008 (fetch_en, SPER_EOC_ID=0, base
+               //    0x10200000) via JTAG SBA. Address 0x10200008 is inside AXI_PLUG space
+               //    (0x10000000–0x10400000) so the SoC crossbar routes it to the cluster.
+               //    crt0.S gates on mhartid so only core 0 runs se_smoke; cores 1–7 spin WFI.
+               debug_mode_if.init_dmi_access(s_tck, s_tms, s_trstn, s_tdi);
+               debug_mode_if.set_dmactive(1'b1, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
+               debug_mode_if.set_sbreadonaddr(1'b1, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
+               $display("[TB] %t - PRELOAD: CCU fetch_en write (0x10200008 ← 0xFF) — all cluster cores → 0x1C008080", $realtime);
+               debug_mode_if.writeMem(32'h10200008, 32'hFF, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
             end
 
             if (ENABLE_DPI == 1) begin
