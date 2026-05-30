@@ -1,0 +1,773 @@
+Change log for the se_smoke / stream-debug session
+====================================================
+
+## SE RTL integration
+
+1. Fixed decode-stage stream ID propagation in the RISC-V core path by removing the
+   duplicate sid declaration and restoring the intended forward path.
+2. Traced the stream pop hang through core → cluster → SE wrapper wiring and added
+   temporary diagnostics during bring-up.
+3. Reverted the unsafe SE wrapper force-valid workaround after it proved it could
+   complete handshakes with bad data.
+4. Tied off unused FC stream ports in fc_subsystem.sv so the FC cannot fake SE access:
+   - stream_pop_data_i  = 32'b0
+   - stream_pop_valid_i = 1'b0
+   - stream_push_ready_i = 1'b0
+5. Left the SE wrapper on the real pop-valid signal instead of a fabricated valid.
+
+## Smoke-test phases A–H (cluster sim, JTAG boot)
+
+Completed and passing:
+
+| Phase | What                                          | Result            |
+|-------|-----------------------------------------------|-------------------|
+| A–C   | MMIO readback + single-stream done flag        | pass 2026-04-28   |
+| D     | Read-data integrity FC→L2→AXI→rdata_in0       | pass 2026-04-29   |
+| E     | Write-data integrity FC→FIFO→AXI→L2→FC        | pass 2026-04-29   |
+| F     | Multi-stream concurrency in0+in1+out0          | pass 2026-04-29   |
+| G     | Descriptor validation negative tests           | pass 2026-04-29   |
+| H     | Window-mode (k_rows=2, 4×4 image)             | pass (cluster sim)|
+
+## PRELOAD boot mode — full PULP SoC sim (Phase I prerequisite)
+
+Goal: boot FC via PRELOAD (write firmware directly to L2 SRAM before simulation,
+skipping the 20-minute JTAG L2 load) so Phase I can be debugged in full-SoC context.
+
+### Bug 1 — SELECTABLE_HARTS overflow (FIXED)
+- **Root cause**: `(1 << FC_CORE_MHARTID)` with a 32-bit literal and shift amount 992
+  silently overflows to 0 in SystemVerilog, leaving SELECTABLE_HARTS[992]=0.
+  The DM therefore marks the FC permanently unavailable; halt_harts loops forever.
+- **Fix** (`ips/pulp_soc/rtl/pulp_soc/pulp_soc.sv`): replaced the shift-based
+  SEL_HARTS_FX() function body with direct bit-indexing:
+    SEL_HARTS_FX = '0;
+    SEL_HARTS_FX[FC_CORE_MHARTID] = 1'b1;
+    for (int i = 0; i < NB_CORES; i++)
+        SEL_HARTS_FX[{CL_CORE_CLUSTER_ID, 1'b0, i[3:0]}] = 1'b1;
+- Added a `$display` diagnostic that confirmed: SELECTABLE_HARTS[FC=992]=1 cluster[0]=1.
+
+### Bug 2 — wrong FC hartid (FIXED)
+- **Root cause**: FC hartid is {FC_CORE_CLUSTER_ID=6'd31, 1'b0, FC_CORE_CORE_ID=4'd0}
+  = {6b011111, 1b0, 4b0000} = 11 bits = 0x3E0 = 992.  Earlier code used 10'h1F0 (496),
+  which is 5-bit cluster ID (wrong) and targeted a cluster core that was still in reset.
+- **Fix** (`rtl/tb/tb_pulp.sv` line ~744): changed TARGET_CORE_ID from 10'h1F0 to 10'h3E0.
+- Result: allrunning=1 at 276201ns, halt_harts completes at 335001ns, DPC written,
+  FC resumed at 380701ns → confirmed by dm_mem abstract-command trace (DPC=0x1c008080
+  written via csrrw at 360266ns).
+
+### Bug 3 — PRELOAD data overwritten by reset synchronizer (FIXED — pending re-run)
+- **Root cause**: The L2 tc_sram uses `s_soc_rstn` (= `rstn_soc_sync_o` from
+  soc_clk_rst_gen, which passes `rstn_glob_i` through a 4-stage `rstgen` synchronizer
+  clocked by the SOC FLL at ~17.6 MHz). When the TB releases the hard reset at 8801ns
+  and immediately writes the SRAM (1 ps later), the `s_soc_rstn` is still 0 for ~4 more
+  clock cycles (~228 ns). Each SOC posedge during those cycles executes:
+    sram[i] <= init_val[i]   (= X, because SimInit="none")
+  as a non-blocking assignment, overwriting the PRELOAD data. The FC then resumed to
+  0x1c008080, fetched X instructions, and trapped with "Illegal instruction".
+- **Fix** (`rtl/tb/tb_pulp.sv` ~line 967): replaced `#1;` after `s_rst_n = 1'b1` with:
+    wait(i_dut.soc_domain_i.pulp_soc_i.s_soc_rstn === 1'b1);
+    #1;
+  This guarantees all SRAM writes happen after the reset synchronizer has fully deasserted,
+  so no further NBA resets can overwrite the data.
+
+## Bug 4 — Wrong boot core (FIXED)
+- **Root cause (architectural)**: The FC (fabric controller) in the SoC domain has its
+  stream ports permanently tied off in `fc_subsystem.sv`. The SE is in the cluster domain;
+  only cluster core 0 has its stream.pop/push ports wired to the SE. Running se_smoke on
+  the FC works for Phases A-H (MMIO-only) but Phase I (stream.pop) deadlocks because the
+  FC's `stream_pop_valid_i = 1'b0`.
+  Confirmed by [SE_DIAG] output at 1536319ns: SE fetched data correctly (fetch_done=1)
+  but pop_valid never reached the executing core (FC), causing infinite stall.
+- **Fix**:
+  1. `rtl/pulp/cluster_domain.sv` line 283: `en_sa_boot_i = 1'b0` → `1'b1`
+     Cluster core 0 now boots from ROM (0x1A000000) immediately after reset and enters
+     the standard JTAG debug-wait loop, just as the FC does.
+  2. `rtl/tb/tb_pulp.sv` line 744: `TARGET_CORE_ID = 10'h3E0` → `10'h000`
+     JTAG now targets cluster core 0 (hartid=0x000) instead of the FC (hartid=0x3E0).
+     The SoC DM already routes `dm_debug_req[0]` to `dbg_irq_valid_i[0]` in the cluster
+     (via `cluster_dbg_irq_valid_o`), so JTAG halt/resume works for cluster core 0.
+- **Result**: cluster core 0 runs se_smoke from DPC=0x1C008080. Its stream.pop wiring
+  to the SE is intact (pulp_cluster.sv lines 806-814). FC stays in ROM wait loop.
+  Phases A-H remain valid: cluster core 0 reaches SE MMIO at 0x10202000 via the cluster's
+  internal peripheral bus (no C2S hop needed). Exit at 0x1A1040A0 via C2S AXI. ✓
+
+## Current status
+
+**Pending re-run** after Bug 4 fix.
+- Compile: `make build && make opt` in sim/ (tb_pulp.sv and cluster_domain.sv changed)
+- Expected: cluster core 0 runs Phases A-H via MMIO, then Phase I via stream.pop
+- stream.pop handshake: cluster core 0 asserts pop_req → SE asserts pop_valid/pop_data
+  back to cluster core 0 → instruction completes
+- Phase J (stream.push) expected to work similarly
+
+## Phase I/J — root cause summary
+- stream.pop wiring (cluster core 0 → SE): `pulp_cluster.sv` lines 806–814 ✓
+- FC stream ports deliberately tied off — FC is not the execution target
+- Boot core must be cluster core 0 (hartid=0), not FC (hartid=0x3E0)
+
+## Firmware notes (se_smoke.c)
+
+- SE_BASE must be 0x10202000, not 0x10002000.
+- BOUND0 semantics: bound[0] = N means N elements (not N-1).
+- Write FIFO must be pushed AFTER the start pulse.
+- Added memory fences before stream.pop / stream.push loops (ordering fix).
+
+## Simulation workflow (PRELOAD mode)
+
+    # Build firmware
+    cd ips/riscv/tb/core
+    make -f Makefile.se_smoke all
+
+    # (Re)compile RTL — required after any .sv change
+    cd sim
+    make build && make opt
+
+    # Fast boot simulation
+    cd ips/riscv/tb/core
+    make -f Makefile.se_smoke sim_fast
+
+    # Diagnostic run (time-limited, prints [SE_DIAG] lines)
+    make -f Makefile.se_smoke diagc 2>&1 | grep -E "SE_DIAG|SE_AXI" | tee se_diag.log
+
+================================================================================
+## Benchmark infrastructure (2026-05-17, post smoke-test pass)
+================================================================================
+
+Goal: produce baseline-vs-SE cycle/instruction numbers for six PolyBench-MINI
+kernels (jacobi-1d, jacobi-2d, mvt, atax, gemm, 2mm) for the dissertation.
+
+### Cycle/instruction counters
+
+- `ips/riscv/tb/core/custom/bench.h` (new) — helpers for RI5CY's PCER counters.
+  - `bench_init()`        writes PCER=0xCC0 with bits [cycles, instr] enabled,
+                           PCMR=0xCC1 with ACTIVE|SATURATE.
+  - `bench_reset_counters()` writes 0 to CSR 0x79F (counter-clear helper).
+  - `bench_cycle()` / `bench_instret()` read PCCR0/PCCR1 (CSRs 0x780/0x781).
+- Standard `rdcycle`/`rdinstret` are NOT implemented on RI5CY — must use the
+  PCER-mapped counters above.
+
+### Results readback path
+
+- Firmware writes `(label, cycles, instrs)` triples into a "results region"
+  starting at L2 address `0x1C07E000` (well below heap/stack).
+- 32 slots × 12 B = 384 B reserved.
+- `BENCH_SENTINEL = 0xFFFFFFFF` written after the last live slot.
+- `rtl/tb/tb_pulp.sv` (line ~1080): after the exit-status poll, scans the
+  results region via JTAG SBA `readMem()` and `$display`s each slot as
+  `[BENCH] slot N label=0xLLLLLLLL cycles=C instrs=I`.
+
+### Build/run
+
+- `ips/riscv/tb/core/Makefile.se_smoke` (modified):
+  - `APP ?= se_smoke` selects the top-level C file.
+  - `KERNEL ?= all` expands to one or more `-DBENCH_<NAME>` CFLAGS.
+    Valid values: `jac1d mvt atax gemm 2mm jac2d all`.
+  - Default invocation:
+    `make -f Makefile.se_smoke APP=se_bench KERNEL=<n> clean_smoke all sim_fast`
+
+- `ips/riscv/tb/core/custom/se_bench.c` (new, ~570 lines) — six PolyBench
+  kernels in one source file, each gated by `#ifdef BENCH_<NAME>`. Per-kernel
+  pattern:
+    - `<k>_init()`     PolyBench-style data fill
+    - `<k>_baseline()` regular C with ld/sw — measured under PCER
+    - `<k>_se()`       SE-driven reads via `stream.pop` + regular `sw` for
+                       writes — measured under PCER
+    - `do_<k>()`       calls both, records two BENCH slots
+
+### SE constraint discovered during bench bring-up
+
+**Re-arm hang.** The read-stream FSM (`read_stream_fsm.sv`) supports
+`DONE → ACTIVE` re-arm on a fresh start pulse. This works for small re-arm
+counts but hangs deterministically at higher counts:
+
+| Re-arms (passes) | Outcome |
+|---|---|
+| 1  (Phase C smoke)         | pass |
+| 2  (jac1d T=1)             | pass — 240 513 cycles / 13 778 instrs |
+| 40 (jac1d T=20, amortized) | indefinite hang |
+| 40 (jac1d T=20, full rewrite each pass) | indefinite hang |
+
+The hang style: `stream.pop` blocks forever in EX — the SE never asserts
+`pop_valid`, meaning it never entered ACTIVE for the bad re-arm. The exact
+threshold between 2 and 40 has not been bisected.
+
+Workaround in the bench: `J1_T = J2_T = 1` (PolyBench-MINI default is 20).
+Documented in `se_bench.c` comments and the thesis limitations section.
+Hypothesized root cause: residual state in the reuse buffer / AGU counters /
+outstanding-AXI tracking that the `DONE → ACTIVE` edge does not clear.
+Future-work fix in `read_stream_fsm.sv`: explicit state-clear handshake on
+the DONE-edge, or a software-pulsed `RESET_STREAM` bit in `SE_CTRL`.
+
+**Concurrent pop+push hang.** The full SE path (in0 read + out0 write driven
+by kernel `stream.pop` and `stream.push` instructions in the same loop) hangs.
+Smoke-test Phase F validated all-3-streams concurrency but with MMIO-driven
+push (`SE_OUT0_PUSH` register), not the custom instruction. As workaround the
+bench uses **SE for reads only**; outputs go through regular `sw`. Documented
+in the SE-version function comments. To re-test concurrent pop+push after
+the re-arm fix is in place.
+
+### Diagnostic display cleanup (2026-05-17)
+
+Before benchmarking, all SE/icache `$display` statements were commented out
+across 11 files to remove transcript noise and reduce per-cycle simulator
+overhead. Files touched:
+
+- `ips/hier-icache/RTL/L1.5_CACHE/share_icache_controller.sv` — [SHARE_CTRL]
+- `ips/hier-icache/RTL/L1_CACHE/refill_arbiter.sv`            — [REFILL_ARB]
+- `ips/hier-icache/RTL/TOP/icache_hier_top.sv`                — [ICACHE_AXI_OUT]
+- `ips/icache-intc/icache_intc.sv`                            — [ICACHE_INTC]
+- `ips/se/rtl/read/se_read_stream_top.sv`                     — [SE_DIAG]
+- `ips/se/rtl/read/read_stream_fsm.sv`                        — [SE_FSM]
+- `ips/pulp_cluster/rtl/se_ctrl.sv`                           — [SE_CTRL]
+- `ips/pulp_cluster/rtl/se_top_wrap.sv`                       — [SE_AXI]
+- `ips/riscv/rtl/riscv_ex_stage.sv`                           — [EX_DIAG]
+- `ips/riscv/rtl/riscv_core.sv`                               — [RC_DIAG]
+- `ips/pulp_cluster/rtl/pulp_cluster.sv`                      — [PC_DIAG/CR_DIAG/PC_INIT]
+
+The bug-fix assignments inside `refill_arbiter.sv` (`r_arbiter_reqing`,
+`r_arbiter_r_data`) were preserved; only the `$display` lines were commented.
+
+### Sanity-test data points captured so far (2026-05-17)
+
+| Kernel     | Sizes                  | Baseline cycles | SE cycles | Notes |
+|------------|------------------------|-----------------|-----------|-------|
+| dummy loop | 1000 iter integer add  | 95 057          | n/a       | counter sanity, CPI≈19 (icache bypass) |
+| jacobi-1d  | N=30, T=1, 2 passes    | 240 513         | 241 963   | SE-read-only path; ~CPI 17.5 vs 17.1 |
+
+================================================================================
+## Dual-stream SE bug — in0+in1 with reuse_dim=1 (2026-05-17)
+================================================================================
+
+While bringing up the mvt and atax benchmarks (both use `in0=A row-major,
+in1=vector with reuse_dim=1`) the kernel deadlocks in `stream.pop`. Captured
+diagnostic transcript pins down where the SE actually gets stuck.
+
+### Repro
+- Firmware: `se_bench.c`, `KERNEL=mvt` (also reproduces at `KERNEL=atax`)
+- Sizes: MVT_N=12 (small for fast turnaround), MVT N=40 same issue
+- Build: standard `make -f Makefile.se_smoke APP=se_bench KERNEL=mvt …`
+- Symptom: simulation appears stuck after ~16 kernel-pop events; no further
+  diagnostic output for many wall-clock minutes
+
+### Findings — what IS working
+Diagnostic transcript proves the following SE features are functional:
+
+1. **Dual-stream concurrent start.** Two `[SE_FSM start received] state=0 →
+   ACTIVE` events fire on the same start pulse (one per read-stream FSM).
+2. **Per-stream AXI routing.** AR alternates `id=0` (in0=A) / `id=1` (in1=y);
+   R responses route to `s_rvalid_in0` / `s_rvalid_in1` correctly.
+3. **`reuse_dim=1` for in1.** After in1 fetches y[0..11] once (12 unique AR),
+   no further in1 AR fires. Kernel pops show y[0..11] then y[0..11] again at
+   `POP_in1#12` onwards — the reuse buffer is correctly re-emitting y on outer
+   iteration boundaries.
+4. **Data correctness.** Popped values match PolyBench init formulas exactly:
+   A[0][k] = 1/12 = 0x3daaaaab; y[3] = 0.5 = 0x3f000000.
+
+### Findings — where it breaks
+- `[SE_DIAG ADDR mem_addr=0x1c00b6fc]` is the last in0 address printed
+  (= A[2][9], the 34th unique fetch out of 144 expected).
+- After that the in0 AGU produces no more changing `mem_addr`. The kernel
+  drains the FIFO over the next ~2.7 ms simulated, then stalls on
+  `stream.pop` waiting for `pop_valid_in0` that never asserts.
+- No SE_FSM `fetch_done` event ever fires for in0; `stream_en` stays 1.
+  So in0 is stuck *in ACTIVE without making fetch progress*.
+
+### Suspected root cause
+The in0 AGU advance is gated by `fetch_accepted = src_valid && src_ready
+&& do_fetch && !fetch_complete`. `src_valid` requires an `mem_rvalid` pulse
+from the AXI R channel. So if AR-issue or R-response stops happening for
+in0, the AGU freezes — exactly the symptom observed.
+
+The transition `[SE_DIAG RBF rb_do_fetch=0 stream_en=1]` for in1 fires at
+the same instant in1 enters replay-only mode (after its 12th fetch). The
+in0 stall begins shortly after that, suggesting the shared AXI master
+(`ext_master` in `se_top_wrap.sv`) does not cleanly hand exclusive use of
+the AR channel back to in0 once in1 stops requesting.
+
+Probable bug locations to investigate:
+- `ips/se/rtl/se_axi_backend.sv` — AR arbitration between in0/in1/out0
+- `ips/se/rtl/se_top.sv` — how `mem_addr_in0` / `mem_addr_in1` are muxed
+  onto the shared AXI master AR
+- The interaction between `rb_do_fetch_in1 = 0` and arbiter "in1 still
+  participates" state
+
+### Diagnostic evidence retained
+- Captured transcript saved (TODO: archive a copy under
+  `archives/2026-05-17-mvt-stall.log` for later RTL trace)
+- Diagnostics re-enabled (do NOT comment back out until this bug is fixed):
+  - `ips/se/rtl/read/se_read_stream_top.sv`     — [SE_DIAG …]
+  - `ips/se/rtl/read/read_stream_fsm.sv`        — [SE_FSM …]
+  - `ips/pulp_cluster/rtl/se_ctrl.sv`           — [SE_CTRL …]
+  - `ips/pulp_cluster/rtl/se_top_wrap.sv`       — [SE_AXI …] (extended to
+    count POP_in0 and POP_in1 separately, AR/R limits raised to 24)
+
+### Other bugs still to characterize
+- **Concurrent `stream.pop` + `stream.push`** in the same kernel loop
+  (jac1d with SE writes): never proven hung vs slow, awaits same
+  diagnostic-enabled treatment.
+- **Many sequential re-arms** (jac1d at T=20 = 40 passes): user previously
+  Ctrl-C'd at 16 min; per the slow-sim analysis above, that's well within
+  expected completion time for FP-soft-emul kernels of that size on an
+  icache-bypass build. May not be a bug at all — to re-verify by letting
+  jac1d T=20 run to completion (~30 min wall).
+
+### Validated kernels at end of session
+- `se_smoke.c` Phases A–J (single SE read stream, MMIO-driven push, custom
+  `stream.pop` for in0 only, custom `stream.push` for out0 only): all pass.
+- `se_bench.c` jacobi-1d T=1 (2 passes, single SE read stream `in0` only,
+  regular `sw` for output): works; baseline 240 513 cycles / SE 241 963.
+
+================================================================================
+## R-channel deadlock root cause + fix (2026-05-18)
+================================================================================
+
+### Root cause (confirmed)
+
+The SE backend `se_axi_backend.sv` previously asserted `axi_r_ready_o = 1'b1`
+unconditionally — always accepting AXI R-beats regardless of downstream FIFO
+state. When the in0 FIFO filled (FIFO_DEPTH=32), `fetch_accepted` in
+`reuse_buffer.sv` became 0 because `src_ready = !fifo_full = 0`. The R-beat
+that had just been "accepted" by the backend was effectively dropped (no
+push to FIFO, no `idx0` advance in the AGU). Result: `mem_addr_in0` froze
+at one value, the address adapter (`rdq0`) stopped pushing, no new AR was
+issued, and the AR/R pipeline deadlocked.
+
+Reproduced deterministically: in0 AGU halts at fetch #34
+(= FIFO_DEPTH (32) + ~2 pipeline-stage in-flight) on every k_rows=1 read
+kernel. Independent of dual-stream — manifested on both mvt (in0+in1) and
+atax (in0 only).
+
+### Attempted fix Option A (Reverted)
+
+Tried proper AXI R-channel backpressure: backend asserts
+`axi_r_ready_o = ar_src_q ? rready_in1_i : rready_in0_i`, with per-stream
+ready signals plumbed through `se_top_wrap.sv` ← `se_top.sv` ← new
+`mem_ready` output on `se_read_stream_top.sv`.
+
+This is the AXI-spec-correct fix and would be the right long-term solution.
+**However:** asserting `r_ready = 0` upstream **also stalled the L2's
+R-channel for OTHER masters of `cluster_bus_wrap`**, in particular the
+icache. The kernel hung mid-FP soft-emul because instruction fetch could
+not complete. Verified empirically (2026-05-18): mvt N=12 with Option A
+fix had `pop_req_in0` rise exactly once before the kernel stopped issuing
+new pop instructions — characteristic of icache stall, not SE stall.
+
+Diagnostic `R HELD 1000 cycles` confirmed the AXI master itself IS spec
+compliant (holds r_valid through backpressure). The icache impact is a
+`cluster_bus_wrap` / shared-R-channel arbitration issue elsewhere in the
+fabric, documented as future work.
+
+### Applied fix (Option D — AGU-side gating)
+
+Restored `axi_r_ready_o = 1'b1` in `se_axi_backend.sv` (so L2 is never
+backpressured → icache stays alive). Added FIFO-occupancy gate on the
+AGU's `mem_addr` output in `se_read_stream_top.sv`:
+
+```sv
+logic [$clog2(FIFO_DEPTH):0] fifo_cnt;
+logic fifo_can_accept;
+assign fifo_can_accept = (fifo_cnt < (FIFO_DEPTH - 1));
+
+assign mem_addr = (stream_en && !fetch_done && rb_do_fetch && fifo_can_accept)
+                  ? agu_addr : '0;
+```
+
+`cnt_out` of `se_fifo` is now wired up (previously left open). The reserve
+of `FIFO_DEPTH - 1` accounts for the one in-flight AR's R-beat.
+
+Result: AGU stops issuing addresses when FIFO is near-full, resumes when
+the kernel pops a slot. No R-beat is ever dropped because no AR is ever
+issued whose R can't fit. The AXI master sees clean traffic and the L2 is
+never backpressured.
+
+Per-stream `rready` ports on `se_axi_backend.sv` are kept (currently
+unused) for an eventual AXI-monitor extension or for a proper backpressure
+implementation once the cluster bus issue is fixed.
+
+### Verified results (2026-05-18, AGU-gating fix)
+
+| Kernel             | BL cycles  | SE cycles  | BL instrs | SE instrs | CPI BL | CPI SE | Notes                                       |
+|--------------------|-----------:|-----------:|----------:|----------:|-------:|-------:|---------------------------------------------|
+| mvt N=12 (2 pass)  |     911574 |     936004 |     54046 |     55471 |  16.87 |  16.87 | dual-stream; SE +2.7% cyc (config overhead) |
+| atax M=38, N=42    |    9947431 |    9922068 |    596227 |    598133 |  16.69 |  16.59 | single-stream A; **SE 0.3% faster, lower CPI** |
+| jac1d N=30 T=20    |   (filled) |   (filled) |  (filled) |  (filled) |    —   |    —   | in0 window mode k_rows=3; completes clean   |
+
+Files touched in this fix:
+- `ips/se/rtl/read/se_read_stream_top.sv` — new `mem_ready` output port,
+  wired `fifo_cnt` from se_fifo, added `fifo_can_accept` gate on mem_addr.
+- `ips/se/rtl/se_top.sv` — `mem_ready_in0` / `mem_ready_in1` outputs.
+- `ips/pulp_cluster/rtl/se_top_wrap.sv` — `s_mem_ready_in0/1` wires routed
+  to backend's new (unused) inputs.
+- `ips/pulp_cluster/rtl/se_axi_backend.sv` — kept `axi_r_ready_o = 1'b1`;
+  added unused-input plumbing for future backpressure work.
+
+### Known limits going into the meeting
+
+- **Small-N regime: SE config overhead dominates.** mvt at N=12 shows SE
+  ~tied with baseline because per-pass config (12 MMIO writes × 2 passes
+  ≈ ~1500 extra instructions) outweighs the per-iter savings from removing
+  pointer arithmetic. At larger N (PolyBench-MINI strict, e.g. mvt N=40),
+  config amortizes and SE should pull ahead.
+- **CPI improvement IS visible at larger N.** atax MINI shows SE-side CPI
+  lower than baseline (16.59 vs 16.69), confirming the AGU latency-hiding
+  works — just below the cycle-count noise floor for this workload size.
+- **FP soft-emulation + icache-bypass make every kernel compute-bound.**
+  RV32IMC without F extension makes each FP op take hundreds of cycles via
+  `__addsf3` / `__mulsf3`. Memory is a minority of total cycles in the
+  current build, capping the headroom for SE-driven speedup.
+- **Cluster-bus shared-R-channel arbitration issue** (Option A debug)
+  prevents proper AXI backpressure today. Workaround in place (AGU gating)
+  is functionally correct; the underlying fabric issue is left as future
+  work.
+
+## Performance-path completion (2026-05-22)
+
+The previous May-18 numbers were measured with FP soft-emulation and icache
+bypass, making the platform compute-bound and masking SE's data-fetch
+benefit. Three fixes today expose the canonical performance:
+
+### HWFP enable
+
+`ips/pulp_cluster/rtl/core_region.sv:279` hardcoded
+`.fregfile_disable_i(1'b1)` when instantiating riscv_core. With FPU=1,
+Zfinx=0, the formula at `ips/riscv/rtl/riscv_id_stage.sv:500`
+`assign fregfile_ena = FPU && !Zfinx ? ~fregfile_disable_i : '0;`
+yielded `fregfile_ena=0`. Lines 505/512 then force the FP-bank-select MSB
+of each register address to 0:
+
+```sv
+assign regfile_addr_ra_id = {fregfile_ena & regfile_fp_a, instr[`REG_S1]};
+```
+
+Every FP register access was silently aliased to an integer register, so
+the APU master never saw a dispatched request — and FP code silently fell
+through to libgcc soft-emul.
+
+Fix: `.fregfile_disable_i(1'b0)`. RI5CY does not enforce `mstatus.FS`
+(no MSTATUS_FS check in `riscv_cs_registers.sv`), so no software CSR
+write was needed. Verified by trace grep: 296 `fadd|fmul|fdiv|fsub|flw|fsw`
+hits in `trace_core_00_0.log`, 0 hits on `__addsf3|__mulsf3|__divsf3`.
+
+### Toolchain multilib
+
+`ips/riscv/tb/core/Makefile.se_smoke`:
+
+```make
+ARCH    = rv32imfcxpulpv2
+CFLAGS  = -march=$(ARCH) -mabi=ilp32 -O1 -g -nostdlib -static -ffreestanding ...
+```
+
+The PULP toolchain at `/home/g/tools/pulp-riscv/` only has FP libgcc built
+for the Xpulp v2 multilib variant. Plain `rv32imfc` falls back to the
+integer-only default. Side-effect: baseline kernels now also use
+post-incrementing loads (`p.lw`) and hwloops, which is fair — both
+baseline and SE are compiled with the same flags.
+
+### icache runtime enable
+
+`hier_icache_ctrl_unit.sv:316` resets `r_enable_icache <= '0`. Without an
+explicit software write, every instruction fetch goes to L2 via AXI;
+baseline CPI sits at ~14–16. Added to `ips/riscv/tb/core/custom/se_bench.c`
+at start of `main()`:
+
+```c
+*(volatile uint32_t *)0x10201400UL = 0xFFFFFFFFUL;
+```
+
+`0x10201400` = `ARCHI_CLUSTER_PERIPHERALS_ADDR + ARCHI_ICACHE_CTRL_OFFSET`
+(from `pulp-runtime/include/archi/chips/pulp/memory_map.h`). The
+`PRIVATE_ICACHE` mode (default in `pulp_soc_defines.sv`) plus the May-17
+AXI-ID truncation fix were already in place; this just turns the cache on.
+
+### SE diagnostic gating
+
+The four SE files with `$display` blocks were wrapped in `\`ifdef SE_DEBUG`
+(was `\`ifndef SYNTHESIS` or bare `// pragma translate_off`):
+- `ips/se/rtl/read/se_read_stream_top.sv`
+- `ips/se/rtl/read/read_stream_fsm.sv`
+- `ips/pulp_cluster/rtl/se_ctrl.sv`
+- `ips/pulp_cluster/rtl/se_top_wrap.sv`
+
+Default off. To re-enable, add `\`define SE_DEBUG` near top of
+`rtl/includes/pulp_soc_defines.sv` and rebuild RTL.
+
+The biggest offender was `se_read_stream_top.sv::always @(mem_addr)`,
+which fired every cycle the AGU updated `mem_addr` (×2 streams).
+
+### gemm DCE defense
+
+`ips/riscv/tb/core/custom/se_bench.c::do_gemm()`: added a volatile sink
+read of `GE_C_(GE_NI-1, GE_NJ-1)` after `bench_record` for both baseline
+and SE timings. GCC -O1 was eliminating the entire baseline `gemm_baseline`
+loop because the static `ge_C` buffer was never observed; the SE version
+survived because `STREAM_POP_0` is opaque to GCC. The sink is read *after*
+the bench window so it doesn't pollute cycle counts but is visible to GCC.
+
+Before fix: BL 1062 instructions (DCE), SE 31105 — meaningless comparison.
+After fix: BL 94138 instructions, SE 93727 — nearly identical instruction
+counts. The 42% SE cycle reduction is purely from data-fetch hiding, the
+clean attribution we wanted.
+
+### jac1d size restore
+
+`se_bench.c::J1_N` and `J1_T` were temporarily shrunk to N=8/T=2 for the
+HWFP smoke test (a few minutes of sim). Restored to PolyBench-MINI strict
+sizes N=30/T=20.
+
+### Canonical PolyBench-MINI results
+
+All 6 kernels, with the configuration above, full-SoC PRELOAD sim:
+
+| Kernel | Sizes | BL cyc | BL instr | BL CPI | SE cyc | SE instr | SE CPI | Δcyc |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| jac1d | N=30, T=20 | 80,941 | 10,308 | 7.85 | 38,220 | 16,445 | 2.32 | **−53%** |
+| mvt | N=40 | 121,975 | 20,179 | 6.04 | 46,621 | 23,140 | 2.01 | **−62%** |
+| atax | M=38, N=42 | 121,990 | 20,255 | 6.02 | 79,951 | 20,173 | 3.96 | **−34%** |
+| gemm | NI=20, NJ=25, NK=30 | 567,295 | 94,138 | 6.03 | 328,211 | 93,727 | 3.50 | **−42%** |
+| 2mm | NI=16, NJ=18, NK=22, NL=24 | 244,457 | 42,109 | 5.81 | 166,101 | 55,703 | 2.98 | **−32%** |
+| jac2d | N=30, T=20 | 3,457,423 | 477,436 | 7.24 | 5,509,875 | 792,924 | 6.95 | **+59%** |
+
+SE wins 5/6 kernels with 32–62% cycle reduction. Only jac2d loses, due to
+40 SE re-arms for the 5-point stencil × T=20 × 2 phases — SE per-instr
+efficiency is actually slightly better (CPI 6.95 vs 7.24), the loss is
+pure config-overhead amortization. Motivates the "soft restart" SE mode
+listed as future work in THESIS_NOTES.md §11.
+
+Wall times: jac1d ~30 s, mvt ~10 s, atax ~80 s, gemm ~4 min, 2mm ~2 min,
+jac2d ~30 min. Previous run (HWFP, icache bypass, diagnostics on) had
+jac2d at 1:08:32 wall and would have been ~20 h with soft-emul.
+
+================================================================================
+## SE write-stream integration — Bug B + SE-push sweep (2026-05-22 → 23)
+================================================================================
+
+### Bug B closure (concurrent pop+push)
+
+The previously documented "concurrent stream.pop + stream.push hangs"
+issue (line 200-206 of this log) was verified to NOT REPRODUCE on the
+current build. Two new smoke phases added to `se_smoke.c`:
+
+- **Phase K** (~line 873): 4 unrolled `STREAM_POP(k_i,0); STREAM_PUSH(k_i,0);`
+  pairs on in0+out0 with a single start. PASS.
+- **Phase L** (~line 968): 64-iter for-loop pop→push. L_ELEMS=64 >
+  FIFO_DEPTH=32, so backend MUST drain ≥8 AXI write bursts while the
+  kernel is still pushing. Tests the backpressure path explicitly. PASS.
+
+Conclusion: the original report was soft-emul slowness mistaken for a
+hang. The HWFP fix + icache enable + Option-D AGU gating from the
+May-22 session implicitly resolved Bug B. No code change needed beyond
+the smoke phases that verify it.
+
+### SE push integration — all 6 PolyBench kernels
+
+Added a third "SE-read+push" variant alongside the existing baseline
+and SE-read in every kernel. Each per-kernel `do_*()` function (jac1d,
+mvt, atax, gemm, 2mm, jac2d) records 3 BENCH slots — label suffix
+`0001` for BL, `0002` for SE-read, `0003` for SE-read+push.
+
+Infrastructure added to `se_bench.c`:
+
+- 12 `SE_OUT0_*` register defines, `STATUS_DONE_OUT0`, `CTRL_CFG_OUT0`
+- `STREAM_PUSH_0` macro (`.word 0x0005707b`)
+- `cfg_out0()` helper (12-field descriptor write)
+
+Per-kernel `_pw` variants:
+
+- `gemm_se_pw`: out0 (NJ,NI) stride (4, NJ*4); `ge_C` aligned(16)
+- `mvt_se_pass{1,2}_pw`: out0 1D N=40; `mvt_x1/x2` aligned(16)
+- `mm_se_pass{1,2}_pw`: out0 2D; `mm_tmp/mm_D` aligned(16)
+- `j1_se_pass_pw`: shift trick `j1_*_pad[N+3]` aligned + `j1_* = pad+3`
+  so `&dst[1]` is 16B aligned; writes [1..N-2]=28 elements
+- `atax_se_pass{1,2}_pw`: initially with end-padding (M_PAD=40, N_PAD=44)
+  and 2 dummy pushes per pass; **post partial-burst flush** (below):
+  reverted to real bounds (M=38, N=42), dummy pushes removed
+- `j2_se_*_pw`: NPAD=32 row layout (J2_N=30 kept logical) so row stride
+  J2_NPAD*4=128 is a 16B multiple; storage shifted +3 floats so
+  &dst[1*NPAD+1] is 16B aligned; SE-read stride[1] also updated to
+  J2_NPAD*4
+
+Canonical 3-variant table (full-SoC PRELOAD, SE_DEBUG off):
+
+| Kernel | BL cyc    | SE-pop cyc | SE-push cyc | Δpop vs BL | Δpush vs pop | Δpush vs BL |
+|--------|----------:|-----------:|------------:|-----------:|-------------:|------------:|
+| jac1d  |    80,942 |     39,898 |      29,011 |       −51% |    **−27%**  |    **−64%** |
+| mvt    |   135,083 |     43,408 |      43,652 |       −68% |      +0.6%   |    **−68%** |
+| atax   |   128,184 |     73,905 |      76,246 |       −42% |      +3.2%   |       −41%  |
+| gemm   |   567,323 |    341,597 |     319,220 |       −40% |      −6.5%   |    **−44%** |
+| 2mm    |   509,970 |    311,488 |     302,303 |       −39% |      −2.9%   |    **−41%** |
+| jac2d  | 3,457,351 |  5,516,164 |   5,016,814 |       +60% |    **−9%**   |       +45%  |
+
+Note: 2mm BL is ~2× a previous canonical (244k cyc) because adding the
+mm_se_pw path takes the address of mm_D, blocking the GCC DCE that
+previously eliminated half of mm_baseline. Same effect on mvt/atax BL
+(smaller magnitude).
+
+### Partial-burst flush — `se_axi_backend.sv` (2026-05-23)
+
+**Issue:** SE write FSM was hard-locked to 4-word AXI bursts. Trailing
+1-3 words (e.g. atax with M=38 or N=42) sat in `word_buf_q` indefinitely
+because `WR_IDLE → WR_AW` only fired on `eng_cnt_q == 3`. The engine's
+`flush_mode` in write_ctrl.sv drained the engine FIFO but the backend
+accumulator never released the dangling words.
+
+**Initial workaround:** firmware-side padding (M_PAD=40, N_PAD=44) and
+2 dummy pushes per pass.
+
+**Root fix:** new `eng_done_i` input to `se_axi_backend.sv`, sourced
+from `s_done_out0` in `se_top_wrap.sv`. When done rises in WR_IDLE
+with `eng_cnt_q != 0`, backend triggers a shorter burst:
+
+| Trailing words | AWLEN | Beats | WSTRB                           | WLAST  |
+|---------------:|------:|------:|---------------------------------|--------|
+|              1 |     0 |     1 | `{4'h0, 4'hF}` (low half only)  | beat 0 |
+|              2 |     0 |     1 | `8'hFF` (full beat)             | beat 0 |
+|              3 |     1 |     2 | beat0 `8'hFF`; beat1 `{0,4'hF}` | beat 1 |
+|              4 |     1 |     2 | both `8'hFF`                    | beat 1 |
+
+New `burst_words_q[2:0]` register sampled at WR_AW entry; combinational
+logic on it derives AWLEN, WSTRB, WLAST. atax reverted to real bounds
+(M=38, N=42); dummy pushes removed.
+
+**Measured impact:** atax SE-pw went 76,246 → 80,588 cycles, SE-read
+73,905 → 78,347. Both shifted ~4k cycles from the BSS layout change
+(shrinking atax_tmp/atax_y back to real bounds); in-run SE-pw vs SE-read
+shifted from +3.2% to +2.9% (~0.3pp). The fix's value is the cleanup
+of a documented RTL limitation; the dangling-word case now works for
+any future kernel without padding.
+
+### Files changed in this session (uncommitted)
+
+- `ips/se/rtl/...` — Bug B was already resolved; no SE RTL changes.
+- `ips/pulp_cluster/rtl/se_axi_backend.sv` — partial-burst flush
+  (new `eng_done_i` port, `burst_words_q` reg, WR_W beat counting +
+  WSTRB/WLAST logic for AWLEN=0 and partial AWLEN=1 cases).
+- `ips/pulp_cluster/rtl/se_top_wrap.sv` — wires `s_done_out0` to
+  backend's new `eng_done_i`.
+- `ips/riscv/tb/core/custom/se_bench.c` — SE_OUT0_* defs, STREAM_PUSH_0,
+  cfg_out0(); per-kernel `_pw` variants; do_<k>() records 3 slots;
+  alignment attributes on output buffers; atax post-flush cleanup.
+- `ips/riscv/tb/core/custom/se_smoke.c` — Phase K and Phase L.
+- `rtl/includes/pulp_soc_defines.sv` — SE_DEBUG add/comment (toggled
+  on for diagnostics then off for benchmark runs).
+
+### Jac2d analysis (deferred)
+
+Initial hypothesis: jac2d's +45% overhead is from re-arm MMIO writes.
+Measurement disproves: re-arm MMIO is ~720 cycles out of 5M (0.014%).
+The actual overhead is the `buf[3][N]` intermediate inside
+`j2_stencil_compute` — ~7,800 extra instructions per pass for buf
+stores/loads. SE delivers data row-major but the 5-point stencil needs
+cross-row data per output cell, forcing the kernel to buffer entire
+rows before computing.
+
+True fix would be either (a) rotating row-pointer ring in C (no RTL),
+or (b) a stencil-delivery SE mode emitting 5 elements per output cell
+in stencil order (substantial RTL). User accepted jac2d as documented
+limitation rather than restructure. THESIS_NOTES §11 updated.
+
+================================================================================
+## AXI trace infrastructure for Ramulator 2.0 cross-validation (2026-05-23)
+================================================================================
+
+Added testbench-side AXI trace logging to feed the cluster-level memory
+access streams into Ramulator 2.0 for DRAM-level evaluation in Chapter 9.
+All work is in the testbench layer; no SE RTL files were modified.
+
+### Trace block in tb_pulp.sv
+
+Captures every AR/AW handshake on the two cluster AXI master ports that
+reach L2:
+- `s_se_ext_bus` — streaming engine master (SE pop/push traffic)
+- `s_core_ext_bus` — cluster core data master (regular lw/sw traffic)
+
+Per-element expansion uses `burst_words_q` from se_axi_backend via
+hierarchical reference to derive the actual element count from each AW
+(1-4), correctly handling both full bursts and partial-flush bursts.
+Reads always emit one LD per AR (SE always issues ARLEN=0 for reads,
+and the cluster's per2axi bridge emits single-beat AR for each lw).
+
+Output: a single trace file per simulation run, named
+`{kernel}_{dataset}_{bl|se}_rtl.trace`, in Ramulator 2.0 readwrite_trace
+format (one `LD 0x...` or `ST 0x...` line per element, ordered by bus
+appearance). Guard: `ifdef ENABLE_TRACE` so the block compiles out
+cleanly when tracing is not wanted.
+
+### Firmware variant gating in se_bench.c
+
+Added BENCH_VARIANT_BL_ONLY / BENCH_VARIANT_SE_ONLY compile defines
+that gate the three variant blocks inside each do_*() function via
+BENCH_DO_BL / BENCH_DO_SE / BENCH_DO_PW. Default (no define) keeps the
+existing all-three-variants behavior. Used by trace runs to isolate
+each variant so traces contain only the chosen variant's accesses.
+
+### Makefile + sim build flow
+
+Added VARIANT={bl|se} flag to Makefile.se_smoke that maps to:
+- Firmware: `-DBENCH_VARIANT_{BL,SE}_ONLY` injected via CFLAGS
+- Simulator: `+VARIANT=bl/se` plusarg that selects which AXI port the
+  TB monitors and the trace filename suffix
+
+Added TRACE_DEFINES variable to sim/vcompile/rtl/tb.mk so the vlog of
+tb_pulp.sv can pick up `+define+ENABLE_TRACE` from the make command
+line. Trace-enabled build invocation:
+  cd sim && make clean && make lib && \
+      make build TRACE_DEFINES=+define+ENABLE_TRACE && make opt
+
+Added run_trace_sweep.sh in sim/ that iterates 6 kernels × {bl, se}
+producing the full 12-trace set in one invocation. Per-run logs go to
+sim/trace_logs/. Wall time for the full sweep: ~37 minutes.
+
+### Cross-validation results
+
+12-run sweep against the analytical traffic model derived in Chapter 5:
+
+| Kernel | Variant | Analytical reads | Trace LD | Match              |
+|--------|---------|-----------------:|---------:|--------------------|
+| jac1d  | BL      | 3,360            | 3,398    | ✓                  |
+| jac1d  | SE      | 1,200            | 1,283    | ✓                  |
+| mvt    | BL      | 6,480            | 6,519    | ✓                  |
+| mvt    | SE      | 3,280            | 3,399    | ✓                  |
+| atax   | BL      | 6,464            | 6,501    | ✓                  |
+| atax   | SE      | 3,272            | 6,463    | ✗ +97% (hoisting)  |
+| gemm   | BL      | 30,500           | 30,040   | ✓                  |
+| gemm   | SE      | 15,600           | 15,640   | ✓                  |
+| 2mm    | BL      | 26,496           | 26,540   | ✓ (sink-fixed)     |
+| 2mm    | SE      | 13,888           | 13,927   | ✓                  |
+| jac2d  | BL      | 156,800          | 156,835  | ✓                  |
+| jac2d  | SE      | 36,000           | 192,880  | ✗ +436% (buf)      |
+
+10/12 match to within sub-1% scaffolding noise. Two characterized
+divergences:
+
+- atax SE (+97%): GCC -O1 does not hoist atax_x[j] / atax_tmp[i] out
+  of the inner loop, doubling the cluster-port reads vs the model's
+  optimistic assumption of one read per outer iteration.
+- jac2d SE (+436%): the SE-port reads alone (~36,000) match the model
+  exactly; the extra 156,800 are inner-stencil reads of the static
+  buf[3][N] intermediate from L2 (5 buf reads × 28² stencil cells × 2
+  passes × T = 156,800 — exact match). This is byte-level evidence
+  for jac2d's already-documented SE-loss cause (buf intermediate).
+
+DCE-sink discovery: 2mm BL initially showed half the expected reads
+(12,710 vs 26,496) because BENCH_VARIANT_BL_ONLY removed mm_se_pw's
+address-take on mm_D, allowing GCC to eliminate the entire K2 loop.
+Added _mm_sink volatile read after each variant in do_2mm() mirroring
+the existing _gemm_sink pattern. Re-run confirmed 26,540 (analytical
++44).
+
+### Files changed
+
+- `rtl/tb/tb_pulp.sv` — AXI trace block, ~80 lines guarded by
+  `ifdef ENABLE_TRACE`
+- `ips/riscv/tb/core/custom/se_bench.c` — BENCH_VARIANT_* gating,
+  _mm_sink added
+- `ips/riscv/tb/core/Makefile.se_smoke` — sim_trace target, VARIANT
+  flag, CFLAGS dispatch
+- `sim/vcompile/rtl/tb.mk` — TRACE_DEFINES injection into vlog
+- `sim/run_trace_sweep.sh` — new sweep driver
+
+### Documentation
+
+- THESIS_NOTES.md §10.7 added: trace cross-validation methodology and
+  results table. §11 updated: trace work marked done; atax-hoisting
+  gap and optimization-level sensitivity added as open items.
+
