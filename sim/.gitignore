@@ -1,0 +1,35 @@
+# Trace files (AXI logger output)
+*.trace
+trace_logs/
+
+# Vsim/Questasim scratch
+work/
+transcript
+vsim.wlf
+vsim_stacktrace.vstf
+etch*
+
+# Per-core logs (RI5CY tracer + icache fetch)
+CORE_*.txt
+FETCH_CORE_*.log
+trace_core_*.log
+stdout/
+vopt.log
+vish_stacktrace.vstf
+
+# FLL lock traces
+*_FLL.log
+
+# Per-run diagnostics
+se_diag.do
+se_fast.log
+log_*.txt
+
+# Stim / preload artifacts
+vectors/
+stim.txt
+slm_files/
+fs/
+
+# SRAM dumps
+sram*.txt
