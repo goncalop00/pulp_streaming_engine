@@ -1073,6 +1073,19 @@ module tb_pulp;
                exit_status = `EXIT_FAIL;
             $display("[TB] %t - Received status core: 0x%h", $realtime, jtag_data[0][30:0]);
 
+            // Benchmark-results readback: scan 32 slots × 12 bytes from
+            // 0x1C07E000 (matches BENCH_RESULTS in custom/bench.h). Each slot
+            // is (label, cycles, instrs); 0xFFFFFFFF label terminates.
+            for (int b = 0; b < 32; b++) begin
+               logic [31:0] bench_label, bench_cyc, bench_ins;
+               debug_mode_if.readMem(32'h1C07E000 + b * 12,     bench_label, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
+               if (bench_label === 32'hFFFFFFFF || bench_label === 32'h00000000) break;
+               debug_mode_if.readMem(32'h1C07E000 + b * 12 + 4, bench_cyc,   s_tck, s_tms, s_trstn, s_tdi, s_tdo);
+               debug_mode_if.readMem(32'h1C07E000 + b * 12 + 8, bench_ins,   s_tck, s_tms, s_trstn, s_tdi, s_tdo);
+               $display("[BENCH] slot %0d  label=0x%08h  cycles=%0d  instrs=%0d",
+                        b, bench_label, bench_cyc, bench_ins);
+            end
+
             $stop;
 
          end
@@ -1149,6 +1162,105 @@ module tb_pulp;
          end
       end
 
+   // ─────────────────────────────────────────────────────────────────────────
+   // AXI trace logging for Ramulator 2.0 cross-validation.
+   //
+   // The kernel's total memory traffic to L2 reaches it through two cluster
+   // AXI master ports: the core data master (s_core_ext_bus) for regular
+   // lw/sw, and the streaming-engine master (s_se_ext_bus) for SE pop/push.
+   // To match the analytical model derived in Chapter 5, the trace must
+   // capture every off-cluster memory access from both ports.
+   //
+   //   +VARIANT=bl → baseline run. Kernel issues all accesses as lw/sw, so
+   //                 only s_core_ext_bus carries traffic. SE port is idle.
+   //                 Output: {kernel}_{dataset}_bl_rtl.trace
+   //   +VARIANT=se → SE-pop+push run. SE handles streamed operands (A reads,
+   //                 C writes for gemm). Operands not in any SE stream
+   //                 (B reads for gemm) still go through the cluster data
+   //                 path as regular lw. Both ports are monitored, addresses
+   //                 interleaved in temporal bus order.
+   //                 Output: {kernel}_{dataset}_se_rtl.trace
+   //
+   // Element stride is hardcoded to 4 bytes (float32). SE writes use the
+   // backend's burst_words_q register to derive the per-AW element count
+   // (1-4), covering both full bursts and partial-flush bursts. Core-side
+   // AR and AW are always single-beat in this cluster build, so each
+   // handshake on s_core_ext_bus contributes exactly one trace line.
+   //
+   // Firmware variant gating in se_bench.c ensures each run executes only
+   // its chosen kernel variant, keeping the trace free of contamination
+   // from the other two variants.
+   //
+   // Guard `ifdef ENABLE_TRACE so this compiles out cleanly when disabled.
+   // ─────────────────────────────────────────────────────────────────────────
+`ifdef ENABLE_TRACE
+   integer  trace_fd;
+   string   trace_kernel;
+   string   trace_dataset;
+   string   trace_variant;
+   bit      trace_log_se;
+
+   localparam int TRACE_ELEMENT_SIZE = 4;
+
+   initial begin
+      if (!$value$plusargs("KERNEL=%s",  trace_kernel))  trace_kernel  = "unknown";
+      if (!$value$plusargs("DATASET=%s", trace_dataset)) trace_dataset = "unknown";
+      if (!$value$plusargs("VARIANT=%s", trace_variant)) trace_variant = "se";
+      // In BL mode the SE port is idle, so monitoring it costs nothing
+      // structurally but is skipped for clarity. In SE mode both ports
+      // contribute lines: the SE port for streamed operands and the core
+      // data port for any non-streamed operand still served via lw/sw.
+      trace_log_se = (trace_variant != "bl");
+      trace_fd = $fopen({trace_kernel, "_", trace_dataset, "_", trace_variant,
+                         "_rtl.trace"}, "w");
+      $display("[TRACE] Logging to %s_%s_%s_rtl.trace (core data port%s)",
+               trace_kernel, trace_dataset, trace_variant,
+               trace_log_se ? " + SE port" : "");
+   end
+
+   // Sample on the cluster clock — both monitored ports are synchronous to it.
+   // Within one cycle the core port is logged before the SE port so the trace
+   // ordering is stable across runs even when both ports handshake the same
+   // cycle. Cycle-level ordering is preserved relative to other cycles.
+   always @(posedge i_dut.cluster_domain_i.cluster_i.se_top_wrap_i.clk_i) begin
+      if (i_dut.cluster_domain_i.cluster_i.se_top_wrap_i.rst_ni) begin
+         // ── Core data master (s_core_ext_bus): one LD/ST per AR/AW ─────────
+         if (i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.ar_valid &&
+             i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.ar_ready) begin
+            $fwrite(trace_fd, "LD 0x%016h\n",
+                    64'(i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.ar_addr));
+         end
+         if (i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.aw_valid &&
+             i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.aw_ready) begin
+            $fwrite(trace_fd, "ST 0x%016h\n",
+                    64'(i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.aw_addr));
+         end
+         // ── SE master (s_se_ext_bus): logged only in non-BL variants ──────
+         if (trace_log_se) begin
+            if (i_dut.cluster_domain_i.cluster_i.s_se_ext_bus.ar_valid &&
+                i_dut.cluster_domain_i.cluster_i.s_se_ext_bus.ar_ready) begin
+               $fwrite(trace_fd, "LD 0x%016h\n",
+                       64'(i_dut.cluster_domain_i.cluster_i.s_se_ext_bus.ar_addr));
+            end
+            if (i_dut.cluster_domain_i.cluster_i.s_se_ext_bus.aw_valid &&
+                i_dut.cluster_domain_i.cluster_i.s_se_ext_bus.aw_ready) begin
+               for (int b = 0;
+                    b < int'(i_dut.cluster_domain_i.cluster_i.se_top_wrap_i.i_se_axi_backend.burst_words_q);
+                    b++) begin
+                  $fwrite(trace_fd, "ST 0x%016h\n",
+                          64'(i_dut.cluster_domain_i.cluster_i.s_se_ext_bus.aw_addr +
+                              32'(b * TRACE_ELEMENT_SIZE)));
+               end
+            end
+         end
+      end
+   end
+
+   final begin
+      if (trace_fd) $fclose(trace_fd);
+      $display("[TRACE] Closed AXI trace file");
+   end
+`endif
 
 endmodule // tb_pulp
 

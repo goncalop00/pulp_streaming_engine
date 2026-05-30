@@ -17,6 +17,11 @@
 `ifndef PULP_SOC_DEFINES_SV
 `define PULP_SOC_DEFINES_SV
 
+// Enable SE diagnostic $display blocks (off for benchmark runs to avoid
+// per-cycle simulator overhead). Touches: se_read_stream_top.sv,
+// read_stream_fsm.sv, se_ctrl.sv, se_top_wrap.sv.
+//`define SE_DEBUG
+
 // define if the 0x0000_0000 to 0x0040_0000 is the alias of the current cluster address space (eg cluster 0 is from  0x1000_0000 to 0x1040_0000)
 `define CLUSTER_ALIAS
 // the same for fabric controller
