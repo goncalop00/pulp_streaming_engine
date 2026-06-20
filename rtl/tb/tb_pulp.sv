@@ -1073,10 +1073,10 @@ module tb_pulp;
                exit_status = `EXIT_FAIL;
             $display("[TB] %t - Received status core: 0x%h", $realtime, jtag_data[0][30:0]);
 
-            // Benchmark-results readback: scan 32 slots × 12 bytes from
+            // Benchmark-results readback: scan 64 slots × 12 bytes from
             // 0x1C07E000 (matches BENCH_RESULTS in custom/bench.h). Each slot
             // is (label, cycles, instrs); 0xFFFFFFFF label terminates.
-            for (int b = 0; b < 32; b++) begin
+            for (int b = 0; b < 64; b++) begin
                logic [31:0] bench_label, bench_cyc, bench_ins;
                debug_mode_if.readMem(32'h1C07E000 + b * 12,     bench_label, s_tck, s_tms, s_trstn, s_tdi, s_tdo);
                if (bench_label === 32'hFFFFFFFF || bench_label === 32'h00000000) break;

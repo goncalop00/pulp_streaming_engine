@@ -34,12 +34,27 @@ set -e
 RISCV=${RISCV:-/home/g/tools/pulp-riscv}
 KERNELS=${KERNELS:-"jac1d mvt atax gemm 2mm jac2d"}
 DATASETS=${DATASETS:-"MINI"}
-VARIANTS=${VARIANTS:-"bl se"}
+# VARIANTS defaults to "bl best": baseline plus the kernel's best-engine
+# variant. "best" is mapped per-kernel below:
+#   matrix kernels (gemm, 2mm) and atax → pws  (SE-push dual variant)
+#   mvt, jac1d, jac2d                  → se   (SE-push single-stream)
+# Explicit override is supported (e.g. VARIANTS="bl se" runs the older
+# single-stream pairing for every kernel).
+VARIANTS=${VARIANTS:-"bl best"}
 
 # Positional overrides
 if [ -n "$1" ]; then KERNELS="$1"; fi
 if [ -n "$2" ]; then DATASETS="$2"; fi
 if [ -n "$3" ]; then VARIANTS="$3"; fi
+
+# Map the placeholder "best" to the kernel-specific variant.
+best_variant_for() {
+    case "$1" in
+        gemm|2mm|atax) echo "pws" ;;
+        mvt|jac1d|jac2d) echo "se" ;;
+        *) echo "se" ;;
+    esac
+}
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FW_DIR="$REPO_ROOT/ips/riscv/tb/core"
@@ -50,7 +65,12 @@ mkdir -p "$LOG_DIR"
 start_total=$SECONDS
 for kernel in $KERNELS; do
     for dataset in $DATASETS; do
-        for variant in $VARIANTS; do
+        for variant_raw in $VARIANTS; do
+            if [ "$variant_raw" = "best" ]; then
+                variant=$(best_variant_for "$kernel")
+            else
+                variant="$variant_raw"
+            fi
             tag="${kernel}_${dataset}_${variant}"
             log="$LOG_DIR/${tag}.log"
             start=$SECONDS
