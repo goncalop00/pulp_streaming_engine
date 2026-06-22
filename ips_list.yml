@@ -2,15 +2,18 @@
 # List of IPs and relative branch/commit-hash/tag.
 # Uses the YAML syntax.
 #
-# Dissertation snapshot (2026-06-22): three IPs pinned at the author's forks
+# Dissertation snapshot (2026-06-22): five IPs pinned at the author's forks
 # under github.com/goncalop00, the rest at the original pulp-platform tags.
 # Anyone cloning this repository and running ./update-ips will obtain the
 # exact RTL/firmware tree the dissertation was evaluated on.
 #
 # Forks:
 #   - streaming-engine    (new IP authored for this dissertation)
-#   - pulp_cluster        (pulp-platform v2.0.0 + SE integration changes)
+#   - pulp_cluster        (pulp-platform v2.0.0 + SE integration)
+#   - pulp_soc            (pulp-platform clusterv2 + FC stream-port tie-off
+#                          and SELECTABLE_HARTS overflow fix)
 #   - riscv               (pulp-platform RI5CY + SE-bench firmware)
+#   - hier-icache         (pulp-platform axi_node_dep + refill_arbiter fix)
 #
 # Examples:
 #
@@ -29,9 +32,9 @@
 #
 
 pulp_soc:
-  commit: clusterv2
+  commit: c457369
   server: https://github.com
-  group:  pulp-platform
+  group:  goncalop00
 
 pulp_cluster:
   commit: 4baec0e
@@ -51,5 +54,11 @@ streaming-engine:
 
 riscv:
   commit: dcfd52c
+  server: https://github.com
+  group:  goncalop00
+
+hier-icache:
+  commit: fb1b3d4
+  domain: [cluster]
   server: https://github.com
   group:  goncalop00
