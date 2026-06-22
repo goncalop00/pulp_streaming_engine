@@ -1,4 +1,14 @@
-# PULP
+# PULP — dissertation fork
+
+> **This is a dissertation fork.** Entry point for the master's dissertation
+> *`<DISSERTATION TITLE>`* by Gonçalo Pereira (FEUP).
+> See [`README.thesis.md`](README.thesis.md) for the four-repository chain,
+> the clone-and-build recipe, and how to reproduce the measurements.
+> The upstream PULP documentation is preserved below.
+
+---
+
+## PULP
 
 PULP (Parallel Ultra-Low-Power) is an open-source multi-core computing platform 
 part of the of the ongoing collaboration between ETH Zurich and the University 
