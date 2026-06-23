@@ -3,7 +3,7 @@
 This fork is the top-level entry point for the artifacts of the master's
 dissertation:
 
-> **`<DISSERTATION TITLE>`**
+> **Configurable Streaming Engine for RISC-V Systems**
 > Gonçalo Pereira — Faculdade de Engenharia da Universidade do Porto (FEUP)
 
 The upstream PULP `README.md` is preserved alongside this file. Read that

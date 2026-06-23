@@ -1,8 +1,8 @@
 # PULP — dissertation fork
 
 > **This is a dissertation fork.** Entry point for the master's dissertation
-> *`<DISSERTATION TITLE>`* by Gonçalo Pereira (FEUP).
-> See [`README.thesis.md`](README.thesis.md) for the four-repository chain,
+> *Configurable Streaming Engine for RISC-V Systems* by Gonçalo Pereira (FEUP).
+> See [`README.dissertation.md`](README.dissertation.md) for the repository chain,
 > the clone-and-build recipe, and how to reproduce the measurements.
 > The upstream PULP documentation is preserved below.
 
