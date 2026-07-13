@@ -66,6 +66,30 @@ dissertation; the Ramulator configuration template in Chapter 8.
 Both flows are deterministic: identical inputs yield identical outputs, and
 a single run per cell is the value reported in Chapter 9.
 
+## STRIDE — trace-driven descriptor inference
+
+STRIDE infers Streaming Engine descriptors from an AXI bus trace of the
+*baseline* kernel — no source access, no hand-written descriptors — then
+re-runs the kernel on the engine from the inferred table, bit-exact. The
+inference tool lives in the [`riscv`](https://github.com/goncalop00/riscv)
+fork (`tb/core/custom/stride_infer.py`, ported to C as `stride_infer.c`);
+this repository adds the testbench support in `rtl/tb/tb_pulp.sv`: the
+descriptor-table preload (`+STRIDE_TABLE`) and the in-system trace capture
+(`+STRIDE_INSYS`, a stand-in for an on-chip bus monitor). Emitted tables are
+committed under `sim/stride/`.
+
+Both flows need a trace-enabled RTL build (`make build
+TRACE_DEFINES=+define+ENABLE_TRACE && make opt`). The one-run
+self-configuring demo — capture, infer on the cluster core, self-program the
+engine, all in a single simulation:
+
+```bash
+cd ips/riscv/tb/core
+make -f Makefile.se_smoke APP=se_bench clean_smoke
+make -f Makefile.se_smoke APP=se_bench KERNEL=gemm DATASET=MINI \
+     VARIANT= STRIDE_INSYS=1 TRACE_TAG=bl sim_fast
+```
+
 ## License
 
 This repository inherits the [Solderpad Hardware License v0.51](http://solderpad.org/licenses/SHL-0.51/)
