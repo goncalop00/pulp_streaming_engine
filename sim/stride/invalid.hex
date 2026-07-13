@@ -1,0 +1,21 @@
+// STRIDE invalid table (magic=0) -> forces hand fallback in Phase 1.
+// Preloaded at 0x1C07D000 so the firmware's magic read is DEFINED (not X):
+// tbl->magic == 0 != STRIDE_MAGIC -> stride_program_pass() returns 0 -> hand
+// descriptors. Without this, Phase 1 reads uninitialized L2 and RISCY's
+// branch-X guard $stops the sim (see se_bench.c:190).
+00000000   // magic (invalid)
+00000000   // version
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000
+00000000

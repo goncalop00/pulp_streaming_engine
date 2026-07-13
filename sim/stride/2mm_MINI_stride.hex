@@ -1,0 +1,79 @@
+// STRIDE descriptor table -> L2 @ 0x1C07D000 (placed by testbench; firmware reads from here)
+44525453   // magic "STRD"
+00000001   // version
+00000001   // kernel_id
+00000002   // num_passes
+00000007   // pass[0] valid_mask
+1C00B4A0   // pass[0] in0 base
+00000004   // element_size
+00000003   // dim
+00000016   // bound[0]
+00000012   // bound[1]
+00000010   // bound[2]
+00000004   // stride[0]
+00000000   // stride[1]
+00000058   // stride[2]
+00000001   // k_rows
+00000001   // k_cols
+00000001   // reuse_dim
+1C00BA20   // pass[0] in1 base
+00000004   // element_size
+00000003   // dim
+00000016   // bound[0]
+00000012   // bound[1]
+00000010   // bound[2]
+00000048   // stride[0]
+00000004   // stride[1]
+00000000   // stride[2]
+00000001   // k_rows
+00000001   // k_cols
+00000002   // reuse_dim
+1C00C650   // pass[0] out0 base
+00000004   // element_size
+00000001   // dim
+00000120   // bound[0]
+00000000   // bound[1]
+00000000   // bound[2]
+00000004   // stride[0]
+00000000   // stride[1]
+00000000   // stride[2]
+00000001   // k_rows
+00000001   // k_cols
+00000003   // reuse_dim
+00000007   // pass[1] valid_mask
+1C00C650   // pass[1] in0 base
+00000004   // element_size
+00000003   // dim
+00000012   // bound[0]
+00000018   // bound[1]
+00000010   // bound[2]
+00000004   // stride[0]
+00000000   // stride[1]
+00000048   // stride[2]
+00000001   // k_rows
+00000001   // k_cols
+00000001   // reuse_dim
+1C00CAD0   // pass[1] in1 base
+00000004   // element_size
+00000003   // dim
+00000012   // bound[0]
+00000018   // bound[1]
+00000010   // bound[2]
+00000060   // stride[0]
+00000004   // stride[1]
+00000000   // stride[2]
+00000001   // k_rows
+00000001   // k_cols
+00000002   // reuse_dim
+1C00C050   // pass[1] out0 base
+00000004   // element_size
+00000001   // dim
+00000180   // bound[0]
+00000000   // bound[1]
+00000000   // bound[2]
+00000004   // stride[0]
+00000000   // stride[1]
+00000000   // stride[2]
+00000001   // k_rows
+00000001   // k_cols
+00000003   // reuse_dim

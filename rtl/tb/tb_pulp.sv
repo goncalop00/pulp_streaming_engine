@@ -752,6 +752,12 @@ module tb_pulp;
          logic [31:0] preload_addr, preload_off, preload_word;
          int          preload_bank, preload_s, preload_w;
 
+         // STRIDE closed-loop: descriptor table preload (0x1C07_D000)
+         string       stride_tbl_file;
+         logic [31:0] stride_tbl [0:255];      // 2-pass table = 78 words
+         logic [31:0] stride_addr, stride_off;
+         int          stride_n, stride_i, stride_bank;
+
          error   = 1'b0;
          num_err = 0;
          rd_cnt=0;
@@ -1010,6 +1016,33 @@ module tb_pulp;
                end
                $display("[TB] %t - PRELOAD: SRAM loaded OK", $realtime);
 
+               // ── STRIDE closed-loop: preload the inferred descriptor table ──
+               // Gated by +STRIDE_TABLE=<hex>; harmless when absent. The table
+               // base 0x1C07_D000 is in the interleaved-bank range and lies
+               // above bss/heap (__bss_end ~0x1C023428), so crt0 zeroing does
+               // not touch it. Words are read sequentially (the hex file's
+               // address is documentary only) and placed via the same bank
+               // decode the firmware preload uses.
+               if ($value$plusargs("STRIDE_TABLE=%s", stride_tbl_file)) begin
+                  $display("[TB] %t - PRELOAD: STRIDE table from %s", $realtime, stride_tbl_file);
+                  for (stride_i = 0; stride_i < 256; stride_i++) stride_tbl[stride_i] = 32'bx;
+                  $readmemh(stride_tbl_file, stride_tbl);
+                  stride_n = 0;
+                  while (stride_n < 256 && stride_tbl[stride_n] !== 32'bx) stride_n++;
+                  for (stride_i = 0; stride_i < stride_n; stride_i++) begin
+                     stride_addr = 32'h1C07D000 + stride_i*4;
+                     stride_off  = stride_addr - 32'h1C010000;
+                     stride_bank = stride_off[3:2];
+                     case (stride_bank)
+                        0: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[0].bank_i.sram[stride_off[18:4]] = stride_tbl[stride_i];
+                        1: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[1].bank_i.sram[stride_off[18:4]] = stride_tbl[stride_i];
+                        2: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[2].bank_i.sram[stride_off[18:4]] = stride_tbl[stride_i];
+                        3: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[3].bank_i.sram[stride_off[18:4]] = stride_tbl[stride_i];
+                     endcase
+                  end
+                  $display("[TB] %t - PRELOAD: STRIDE table loaded (%0d words @ 0x1C07D000)", $realtime, stride_n);
+               end
+
                // Wait for cluster FLL to lock and reset synchronizer to clear.
                #200us;
 
@@ -1259,6 +1292,78 @@ module tb_pulp;
    final begin
       if (trace_fd) $fclose(trace_fd);
       $display("[TRACE] Closed AXI trace file");
+   end
+
+   // ── STRIDE in-system capture (+STRIDE_INSYS) ─────────────────────────────
+   // Testbench stand-in for the on-chip bus monitor (S3 design note, option a):
+   // records every core-data-port handshake as the packed record
+   // (addr & ~3) | is_store from reset until the firmware's kernel-END marker
+   // store (0x1C07F008), then deposits {magic, count, entries...} into L2 at
+   // 0x1C050000 for the on-core C inference (stride_infer.c). Same LD-before-ST
+   // per-cycle ordering as the file logger above, so the captured sequence is
+   // identical to the .trace file's core-port lines. On overflow the header
+   // magic is written as 0, so the firmware falls back to hand descriptors
+   // (defined read — no X; cf. the invalid.hex lesson, 2026-07-12).
+   localparam logic [31:0] INSYS_BUF_ADDR = 32'h1C05_0000;
+   localparam logic [31:0] INSYS_MAGIC    = 32'h4543_5254;  // "TRCE" LE
+   localparam int          INSYS_CAP      = 45000;          // gemm MINI: 34752
+
+   bit          insys_en;
+   bit          insys_done;
+   bit          insys_ovf;
+   logic [31:0] insys_buf [0:INSYS_CAP-1];
+   int          insys_n;
+
+   initial begin
+      insys_en   = $test$plusargs("STRIDE_INSYS");
+      insys_done = 0;
+      insys_ovf  = 0;
+      insys_n    = 0;
+   end
+
+   task automatic insys_l2_write(input logic [31:0] addr, input logic [31:0] data);
+      logic [31:0] off;
+      off = addr - 32'h1C01_0000;
+      case (off[3:2])
+         0: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[0].bank_i.sram[off[18:4]] = data;
+         1: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[1].bank_i.sram[off[18:4]] = data;
+         2: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[2].bank_i.sram[off[18:4]] = data;
+         3: i_dut.soc_domain_i.pulp_soc_i.l2_ram_i.CUTS[3].bank_i.sram[off[18:4]] = data;
+      endcase
+   endtask
+
+   task automatic insys_push(input logic [31:0] addr, input bit is_st);
+      if (insys_n < INSYS_CAP) begin
+         insys_buf[insys_n] = {addr[31:2], 1'b0, is_st};
+         insys_n++;
+      end else begin
+         insys_ovf = 1;
+      end
+   endtask
+
+   always @(posedge i_dut.cluster_domain_i.cluster_i.se_top_wrap_i.clk_i) begin
+      if (i_dut.cluster_domain_i.cluster_i.se_top_wrap_i.rst_ni &&
+          insys_en && !insys_done) begin
+         if (i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.ar_valid &&
+             i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.ar_ready) begin
+            insys_push(i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.ar_addr, 1'b0);
+         end
+         if (i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.aw_valid &&
+             i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.aw_ready) begin
+            insys_push(i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.aw_addr, 1'b1);
+            if (i_dut.cluster_domain_i.cluster_i.s_core_ext_bus.aw_addr == 32'h1C07_F008) begin
+               insys_done = 1;
+               insys_l2_write(INSYS_BUF_ADDR,     insys_ovf ? 32'h0 : INSYS_MAGIC);
+               insys_l2_write(INSYS_BUF_ADDR + 4, insys_n);
+               for (int k = 0; k < insys_n; k++)
+                  insys_l2_write(INSYS_BUF_ADDR + 8 + k*4, insys_buf[k]);
+               if (insys_ovf)
+                  $display("[TB] %t - STRIDE_INSYS: OVERFLOW (>%0d ops) — header invalidated, firmware falls back to hand descriptors", $realtime, INSYS_CAP);
+               else
+                  $display("[TB] %t - STRIDE_INSYS: %0d packed ops -> L2 @ 0x%08h", $realtime, insys_n, INSYS_BUF_ADDR);
+            end
+         end
+      end
    end
 `endif
 
