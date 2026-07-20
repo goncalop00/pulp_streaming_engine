@@ -48,7 +48,7 @@ tbtools:
 
 streaming-engine:
   path:   se
-  commit: 606cbde
+  commit: e1960ba
   server: https://github.com
   group:  goncalop00
 
